@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>brepos — secure download</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0f1115; color: #e6e9ef;
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main {
+    width: min(420px, calc(100vw - 32px));
+    background: #171a21; border: 1px solid #262b36; border-radius: 14px;
+    padding: 32px 28px 26px; box-shadow: 0 18px 50px rgba(0,0,0,.45);
+  }
+  h1 { margin: 0 0 4px; font-size: 26px; letter-spacing: .3px; }
+  .sub { margin: 0 0 22px; color: #98a2b3; font-size: 14px; }
+  form { display: flex; flex-direction: column; gap: 10px; }
+  input {
+    width: 100%; padding: 12px 14px; font-size: 15px; border-radius: 9px;
+    border: 1px solid #303747; background: #0f1115; color: #e6e9ef; outline: none;
+  }
+  input:focus { border-color: #4f8cff; box-shadow: 0 0 0 3px rgba(79,140,255,.18); }
+  button {
+    padding: 12px 14px; font-size: 15px; font-weight: 600; border-radius: 9px; border: 0;
+    background: #4f8cff; color: #fff; cursor: pointer;
+  }
+  button:hover { background: #3d7bf0; }
+  button:disabled { opacity: .55; cursor: default; }
+  #status { min-height: 20px; margin: 14px 0 0; font-size: 13.5px; line-height: 1.45; }
+  #status.ok { color: #3fb950; }
+  #status.err { color: #ff6b6b; }
+  #status.busy { color: #98a2b3; }
+  .foot { margin-top: 18px; padding-top: 14px; border-top: 1px solid #262b36;
+          color: #6b7280; font-size: 12px; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+<main>
+  <h1>brepos</h1>
+  <p class="sub">Encrypted archive &mdash; enter your key to download.</p>
+  <form id="f" autocomplete="off">
+    <input id="key" type="password" placeholder="Access key" autocomplete="off" autofocus>
+    <button id="btn" type="submit">Unlock &amp; download</button>
+  </form>
+  <p id="status"></p>
+  <div class="foot"><span>AES-256-GCM</span><span>decrypts in your browser</span></div>
+</main>
+<script>
+const OBJ = 'https://xdjzkabjzxgmtaxrwwgt.supabase.co/storage/v1/object/public/brepos/brepos.enc'; // encrypted archive (Supabase, CORS-open)
+const ITER = 100000;            // PBKDF2 iterations — must match the publisher exe
+const enc = new TextEncoder();
+
+const f = document.getElementById('f');
+const keyInput = document.getElementById('key');
+const btn = document.getElementById('btn');
+const statusEl = document.getElementById('status');
+
+function status(msg, cls) {
+  statusEl.textContent = msg;
+  statusEl.className = cls || '';
+}
+
+async function decrypt(buf, password) {
+  const dv = new DataView(buf);
+  if (buf.byteLength < 8 || dv.getUint8(0) !== 0x42 || dv.getUint8(1) !== 0x52 ||
+      dv.getUint8(2) !== 0x50 || dv.getUint8(3) !== 0x31) {
+    throw new Error('format');
+  }
+  let o = 4;
+  const saltLen = dv.getUint8(o++);
+  const nonceLen = dv.getUint8(o++);
+  const salt = new Uint8Array(buf, o, saltLen); o += saltLen;
+  const iv = new Uint8Array(buf, o, nonceLen); o += nonceLen;
+  const data = new Uint8Array(buf, o, buf.byteLength - o);
+
+  const base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: ITER, hash: 'SHA-256' },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['decrypt']
+  );
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+}
+
+f.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const password = keyInput.value;
+  if (!password) { status('Enter your key first.', 'err'); return; }
+
+  btn.disabled = true;
+  status('Fetching encrypted archive\u2026', 'busy');
+  try {
+    const res = await fetch(OBJ, { cache: 'no-store' });
+    if (!res.ok) throw new Error('fetch');
+    const buf = await res.arrayBuffer();
+
+    status('Decrypting\u2026', 'busy');
+    let plain;
+    try {
+      plain = await decrypt(buf, password);
+    } catch (err) {
+      if (err && err.message === 'format') throw err;
+      throw new Error('wrongkey');
+    }
+
+    // sanity check: decrypted payload must start with a ZIP local-file header ("PK\x03\x04")
+    const head = new Uint8Array(plain, 0, 4);
+    if (head[0] !== 0x50 || head[1] !== 0x4b || head[2] !== 0x03 || head[3] !== 0x04) {
+      throw new Error('wrongkey');
+    }
+
+    const blob = new Blob([plain], { type: 'application/zip' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'brepos.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+
+    status('Downloaded brepos.zip (' + Math.round(blob.size / 1024) + ' KB). Unzip it and you\u2019re done.', 'ok');
+  } catch (err) {
+    if (err && err.message === 'fetch') status('Archive not found on the server yet. Publish it first.', 'err');
+    else if (err && err.message === 'format') status('Corrupted archive (bad format).', 'err');
+    else status('Wrong key \u2014 nothing was downloaded.', 'err');
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
